@@ -1,1 +1,4 @@
 Takes hospital test data & produces transcription: diagnosis & treatment in a systematic form entered in a new database which also stores the doctors' corrections
+
+Starting data exemplification:
+[aireadi](https://docs.aireadi.org/docs/1/dataset/clinical-data/clinical-lab-tests/)
