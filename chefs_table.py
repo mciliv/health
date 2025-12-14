@@ -16,6 +16,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import math
 import os
@@ -131,6 +132,115 @@ def get_ip_location(session: requests.Session, timeout_s: float = 10) -> tuple[P
     label_parts = [p for p in [city, region, country] if p]
     label = ", ".join(label_parts) if label_parts else "(approximate location)"
     return Point(float(lat), float(lon)), label
+
+
+async def _geoclue_fetch_location(timeout_s: float = 12) -> tuple[Point, str]:
+    """
+    Try to fetch a reasonably accurate current location from GeoClue2 (Linux).
+
+    Requires:
+      - GeoClue service available on the system D-Bus
+      - Python package: dbus-next
+    """
+    try:
+        from dbus_next import Variant
+        from dbus_next.aio import MessageBus
+        from dbus_next.constants import BusType
+    except ImportError as e:  # pragma: no cover
+        raise AppError(
+            "Real-time location requires GeoClue + dbus-next.\n"
+            "Install deps with:\n"
+            "  python3 -m pip install -r requirements.txt\n"
+        ) from e
+
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        manager_path = "/org/freedesktop/GeoClue2/Manager"
+        manager_intro = await bus.introspect("org.freedesktop.GeoClue2", manager_path)
+        manager_obj = bus.get_proxy_object("org.freedesktop.GeoClue2", manager_path, manager_intro)
+        manager = manager_obj.get_interface("org.freedesktop.GeoClue2.Manager")
+
+        client_path = await asyncio.wait_for(manager.call_get_client(), timeout=timeout_s)
+
+        client_intro = await bus.introspect("org.freedesktop.GeoClue2", client_path)
+        client_obj = bus.get_proxy_object("org.freedesktop.GeoClue2", client_path, client_intro)
+        client = client_obj.get_interface("org.freedesktop.GeoClue2.Client")
+        props = client_obj.get_interface("org.freedesktop.DBus.Properties")
+
+        # Identify ourselves, and request a reasonably accurate fix.
+        await props.call_set(
+            "org.freedesktop.GeoClue2.Client",
+            "DesktopId",
+            Variant("s", "chefs-table-finder"),
+        )
+        # Accuracy levels (GeoClue): 1=country,2=city,3=neighborhood,4=street,5=exact
+        await props.call_set(
+            "org.freedesktop.GeoClue2.Client",
+            "RequestedAccuracyLevel",
+            Variant("u", 4),
+        )
+
+        await asyncio.wait_for(client.call_start(), timeout=timeout_s)
+
+        # Location is an object-path property which should become available after Start().
+        loc_var = await asyncio.wait_for(
+            props.call_get("org.freedesktop.GeoClue2.Client", "Location"),
+            timeout=timeout_s,
+        )
+        loc_path = loc_var.value
+        if not isinstance(loc_path, str) or not loc_path.startswith("/"):
+            raise AppError("GeoClue did not provide a valid location object path")
+
+        loc_intro = await bus.introspect("org.freedesktop.GeoClue2", loc_path)
+        loc_obj = bus.get_proxy_object("org.freedesktop.GeoClue2", loc_path, loc_intro)
+        loc_props = loc_obj.get_interface("org.freedesktop.DBus.Properties")
+
+        lat_v = await asyncio.wait_for(
+            loc_props.call_get("org.freedesktop.GeoClue2.Location", "Latitude"),
+            timeout=timeout_s,
+        )
+        lon_v = await asyncio.wait_for(
+            loc_props.call_get("org.freedesktop.GeoClue2.Location", "Longitude"),
+            timeout=timeout_s,
+        )
+        acc_v = await asyncio.wait_for(
+            loc_props.call_get("org.freedesktop.GeoClue2.Location", "Accuracy"),
+            timeout=timeout_s,
+        )
+
+        lat = float(lat_v.value)
+        lon = float(lon_v.value)
+        acc_m = None
+        try:
+            acc_m = float(acc_v.value)
+        except Exception:
+            acc_m = None
+
+        label = "Real-time location (GeoClue)"
+        if acc_m is not None and acc_m > 0:
+            label = f"{label} ±{acc_m:.0f} m"
+
+        return Point(lat, lon), label
+    finally:
+        try:
+            bus.disconnect()
+        except Exception:
+            pass
+
+
+def get_realtime_location(timeout_s: float = 12) -> tuple[Point, str]:
+    try:
+        return asyncio.run(_geoclue_fetch_location(timeout_s=timeout_s))
+    except AppError:
+        raise
+    except Exception as e:
+        raise AppError(
+            "Real-time location failed. If you're on Linux, ensure GeoClue is installed/running.\n"
+            "Fallback options:\n"
+            "  - use --use-ip (approximate)\n"
+            "  - use --near \"City, State\" (geocoding)\n"
+            "  - use --lat/--lon (manual)\n"
+        ) from e
 
 
 def geocode(session: requests.Session, query: str, timeout_s: float = 15) -> tuple[Point, str]:
@@ -461,6 +571,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     loc.add_argument("--lat", type=float, help="Latitude")
     loc.add_argument("--lon", type=float, help="Longitude")
     loc.add_argument(
+        "--use-geoclue",
+        action="store_true",
+        help="Use real-time location via GeoClue (Linux system location service)",
+    )
+    loc.add_argument(
         "--use-ip",
         action="store_true",
         help="Use approximate IP geolocation as the search center",
@@ -485,6 +600,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="auto",
         help="Data source to use (default: auto)",
     )
+    srch.add_argument(
+        "--watch",
+        type=float,
+        default=0.0,
+        help="Re-run search every N seconds (useful with --use-geoclue). Default: 0 (run once)",
+    )
+    srch.add_argument(
+        "--clear",
+        action="store_true",
+        help="Clear the screen between watch updates",
+    )
 
     return p.parse_args(argv)
 
@@ -502,6 +628,9 @@ def resolve_origin(
 
     if args.near:
         return geocode(session, args.near)
+
+    if args.use_geoclue:
+        return get_realtime_location()
 
     if args.use_ip:
         return get_ip_location(session)
@@ -544,18 +673,14 @@ def choose_source(args: argparse.Namespace) -> Literal["yelp", "osm"]:
     return "osm"
 
 
-def main(argv: list[str]) -> int:
-    args = parse_args(argv)
+def clear_screen() -> None:
+    # ANSI clear + cursor home (more portable than calling external 'clear').
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
 
-    if args.radius_km <= 0:
-        raise AppError("--radius-km must be > 0")
-    if args.limit <= 0:
-        raise AppError("--limit must be > 0")
 
-    session = _http_session()
-
+def run_once(session: requests.Session, args: argparse.Namespace) -> int:
     origin, origin_label = resolve_origin(session, args)
-
     source = choose_source(args)
 
     start = time.time()
@@ -578,8 +703,32 @@ def main(argv: list[str]) -> int:
     elapsed_ms = int((time.time() - start) * 1000)
     print_results(origin_label=origin_label, origin=origin, radius_km=float(args.radius_km), places=places)
     print(f"\nSource: {source} | Results: {len(places)} | Took: {elapsed_ms} ms")
-
     return 0
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+
+    if args.radius_km <= 0:
+        raise AppError("--radius-km must be > 0")
+    if args.limit <= 0:
+        raise AppError("--limit must be > 0")
+    if args.watch < 0:
+        raise AppError("--watch must be >= 0")
+
+    session = _http_session()
+    if args.watch and args.watch > 0:
+        while True:
+            if args.clear:
+                clear_screen()
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            print(f"As of {now}")
+            print()
+            run_once(session, args)
+            print("\n(Press Ctrl+C to stop)\n")
+            time.sleep(float(args.watch))
+
+    return run_once(session, args)
 
 
 if __name__ == "__main__":
